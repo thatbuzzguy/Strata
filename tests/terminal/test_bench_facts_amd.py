@@ -136,6 +136,69 @@ class ServedName(unittest.TestCase):
         self.assertIn({"name": "rocm", "version": "10.1.0"}, software["runtime"])
 
 
+class CardNumberIsTheEngineNumber(unittest.TestCase):
+    """A report's `device_index` is the number the engine gives the physical card. `amd-smi list`'s own order is not the
+    KFD topology's GPU-node order (#325, #3418), so the number comes from `node_id`; when it cannot be read, the row says
+    so instead of writing a number that could belong to another card."""
+
+    def test_the_number_follows_the_node_order(self):
+        listed = [{"gpu": 0, "bdf": "0000:7c:00.0", "node_id": 2}, {"gpu": 1, "bdf": "0000:03:00.0", "node_id": 1}]
+        self.assertEqual(bf.kfd_device_order(listed), {0: 1, 1: 0}, "amd-smi lists them the other way round")
+        self.assertEqual(bf.kfd_device_order([{"gpu": 0, "bdf": "0000:03:00.0", "node_id": 1}]), {0: 0})
+        self.assertIsNone(bf.kfd_device_order([{"gpu": 0, "bdf": "0000:03:00.0"}]), "no node id: no number")
+
+    @unittest.skipIf(os.name == "nt", "the probe is the non-Windows branch")
+    def test_the_probe_numbers_by_the_node_order(self):
+        listed = [{"gpu": 0, "bdf": "0000:7c:00.0", "node_id": 2}, {"gpu": 1, "bdf": "0000:03:00.0", "node_id": 1}]
+
+        def answer(cmd, timeout=15):
+            return json.dumps(listed) if cmd[:3] == ["amd-smi", "list", "--json"] else run_cmd(cmd, timeout)
+
+        with mock.patch.object(bf, "run_cmd", answer):
+            cards, _ = bf.other_gpus()
+        self.assertEqual([c["device_index"] for c in cards], [1, 0])
+        self.assertFalse(any("number_note" in c for c in cards), "the number is the engine's, not a guess")
+
+    def test_the_report_says_when_the_number_is_a_guess(self):
+        card = {"device_index": 1, "name": "AMD Radeon AI PRO R9700", "memory_bytes": None,
+                "memory_kind": "dedicated", "power_limit_w": None, "number_note": bf.AMD_ORDER_NOTE}
+        why = bf.Why()
+        with mock.patch.object(bf, "nvidia_gpus", lambda: ([], None, None)), \
+             mock.patch.object(bf, "other_gpus", lambda: ([card], None)):
+            block, _ = bf.hardware(why, selected=[], served_gpu="", model_dir=None, declared_background=[])
+        self.assertEqual(block["gpus"][0]["device_index"], 1)
+        self.assertEqual(why["/hardware/gpus/0/device_index"], bf.AMD_ORDER_NOTE)
+        # a row whose number is the engine's own adds nothing to `why`
+        plain = bf.Why()
+        with mock.patch.object(bf, "nvidia_gpus", lambda: ([], None, None)), \
+             mock.patch.object(bf, "other_gpus", lambda: ([{k: v for k, v in card.items() if k != "number_note"}], None)):
+            bf.hardware(plain, selected=[], served_gpu="", model_dir=None, declared_background=[])
+        self.assertNotIn("/hardware/gpus/0/device_index", plain)
+
+
+    def test_windows_names_a_card_only_when_the_number_cannot_point_at_another_one(self):
+        two = [{"name": "AMD Radeon RX 7900 XTX", "driver": "24.3.0", "vram_bytes": 25769803776},
+               {"name": "AMD Radeon AI PRO R9700", "driver": "24.3.0", "vram_bytes": 32 << 30}]
+
+        def read(vendor=None, adapters=two):
+            return adapters
+
+        with mock.patch.object(bf, "run_cmd", lambda cmd, timeout=15: ""), \
+             mock.patch.object(bf.os, "name", "nt"), mock.patch("serve.telemetry.windows_display_adapters", read), \
+             mock.patch("serve.telemetry.windows_amd_cards", lambda a=None: a or []):
+            cards, driver = bf.other_gpus()
+        self.assertEqual([c["device_index"] for c in cards], [0, 1])
+        self.assertTrue(all(c.get("number_note") == bf.AMD_ORDER_NOTE for c in cards),
+                        "two cards that can run a model: the order is the registry's, not HIP's")
+        self.assertEqual(driver, "24.3.0")
+        with mock.patch.object(bf, "run_cmd", lambda cmd, timeout=15: ""), \
+             mock.patch.object(bf.os, "name", "nt"), mock.patch("serve.telemetry.windows_display_adapters",
+                                                                lambda vendor=None: two[:1]), \
+             mock.patch("serve.telemetry.windows_amd_cards", lambda a=None: a or []):
+            cards, _ = bf.other_gpus()
+        self.assertNotIn("number_note", cards[0], "the only card: the number cannot name a different one")
+
+
 class MacStillReadsItsChip(unittest.TestCase):
     """The amd-smi branch is for Linux; a Mac (os.name is posix there too) still takes its card from the chip name."""
 

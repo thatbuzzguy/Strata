@@ -412,6 +412,29 @@ def windows_amd_cards(adapters=None) -> list:
     return [c for c in cards if (c["vram_bytes"] or 0) >= 2 << 30] or cards
 
 
+def named_amd_cards(indices, adapters=None) -> list:
+    """The AMD cards HIP numbers `indices`, as names; None for a card whose name cannot be claimed.
+
+    #1587 took the display-adapter class order as HIP's order, and indexing it with HIP's numbers named the wrong card as
+    soon as the two orders differed.  #325 and #3418 showed they do differ: an integrated Radeon takes HIP ordinal 0 and
+    pushes the discrete card to 1, and an adapter the 2 GiB rule leaves out shifts every name after it.  A name is therefore
+    claimed only when the number cannot point at a different card: the engine is on the only AMD device, or on the only device
+    the 2 GiB rule keeps (the chips it leaves out cannot run a model).  A card that cannot be identified stays unnamed, so the
+    dashboard says the card is not identified instead of naming another one.
+    """
+    cards = windows_display_adapters("amd") if adapters is None else adapters
+    kept = [c for c in cards if (c["vram_bytes"] or 0) >= 2 << 30]
+    out = []
+    for i in indices:
+        if len(cards) == 1 and i == 0:
+            out.append(cards[0])
+        elif len(kept) == 1 and len(cards) > 1:
+            out.append(kept[0])
+        else:
+            out.append(None)
+    return out
+
+
 def free_vram_mib(index=0, amd=False):
     """Free VRAM of a card in MiB, or None when it cannot be read."""
     g = gpu_reader(index, amd)
@@ -533,6 +556,16 @@ class _CpuRamFallback:
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
+def unnamed_card_note(indices, cards) -> str | None:
+    """The sentence for the HIP numbers whose card cannot be identified (`named_amd_cards` answers None for them), so the
+    dashboard says the card is not identified instead of naming another one."""
+    missing = [i for i, c in enumerate(cards) if c is None]
+    if not missing:
+        return None
+    return "cannot name the card the engine numbers " + ", ".join(str(i) for i in missing) + \
+           ": the registry's display-adapter order is not HIP's order (#325, #3418)"
+
+
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
@@ -558,10 +591,17 @@ class Telemetry:
         win_amd = None
         if gpu_name is None and amd and os.name == "nt":
             # #1587: no readings for an AMD card on Windows yet, but its name (and VRAM size) are in the registry, so the
-            # dashboard and strata_bench do not call the run "CPU only".  The class order is taken as HIP's order.
-            cards = windows_amd_cards()
-            win_amd = [cards[i] for i in idx if 0 <= i < len(cards)] or cards[:1]
-            gpu_name = " + ".join(c["name"] for c in win_amd) if win_amd else None
+            # dashboard and strata_bench do not call the run "CPU only".  Only a name that cannot be wrong is claimed
+            # (named_amd_cards); a card whose HIP number cannot be tied to a device is reported as not identified.
+            win_amd = named_amd_cards(idx)
+            claimed = [c for c in win_amd if c]
+            # When no number can be tied to a device, only the vendor is said - the same degradation the Linux reader
+            # makes when the driver's product_name is empty (#170) - so the run is not called CPU only, but no card is named.
+            gpu_name = " + ".join(c["name"] for c in claimed) or ("AMD Radeon" if win_amd else None)
+        base = ("no GPU load or VRAM readings for AMD cards on Windows yet (Linux reads them from the amdgpu "
+                "driver); the engine's own VRAM figures are in its log" if amd and not self.gpu.ok()
+                else getattr(self.gpu, "note", None))
+        note = "; ".join(s for s in (base, unnamed_card_note(idx, win_amd) if win_amd else None) if s) or None
         # the macOS reader knows the device's working set (the VRAM budget of the unified memory); None elsewhere
         vram_total = None
         if win_amd is None and isinstance(self.gpu, _Metal) and self.gpu.ok():
@@ -569,14 +609,12 @@ class Telemetry:
             vram_total = ws >> 20 if ws else None
         self.static = {
             "gpu_name": gpu_name,
-            "gpu_vram_total_mib": (sum(c["vram_bytes"] for c in win_amd) >> 20
-                                   if win_amd and all(c["vram_bytes"] for c in win_amd) else vram_total),
+            "gpu_vram_total_mib": (sum(c["vram_bytes"] for c in win_amd if c) >> 20
+                                   if win_amd and all(c and c["vram_bytes"] for c in win_amd) else vram_total),
             "gpu_count": len(self.gpus),
             # #1380: the AMD readings are the amdgpu driver's Linux sysfs files; a Windows AMD card has none yet, and the
             # dashboard said "not readable (NVML)" or showed empty tiles with no word why
-            "gpu_note": ("no GPU load or VRAM readings for AMD cards on Windows yet (Linux reads them from the amdgpu "
-                         "driver); the engine's own VRAM figures are in its log" if amd and not self.gpu.ok()
-                         else getattr(self.gpu, "note", None)),
+            "gpu_note": note,
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),

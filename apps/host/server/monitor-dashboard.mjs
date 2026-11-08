@@ -1,4 +1,7 @@
+import { engineDevice, engineIndex } from './device-probes.mjs';
+
 const MEASURES=['temperatureC','utilizationPct','memoryUsedGb','powerW','powerLimitW','pcieGen','pcieGenMax','pcieWidth','pcieRxMbs'];
+
 /** The engine's numbers win; a number the engine leaves out comes from the host's own reading of the same card. */
 export function mergeOwnReading(engine,own) {
   if(!own)return engine;
@@ -16,11 +19,16 @@ export function originalDashboard(raw, hardware, fallback) {
   // The host's own sensor readings (nvidia-smi, amdgpu sysfs, the Windows GPU counters) fill in what the engine does not report:
   // an AMD card on Windows has no engine reader at all, and the engine never gives the fan or the clock (#3727).
   const own=new Map((fallback?.hardware?.gpus??[]).map(r=>[r.id,r]));
-  const readings=(hw.gpus??(devices.length===1?[{index:devices[0].index,util:hw.gpu_util,mem_used:hw.gpu_mem_used,temp:hw.gpu_temp,power:hw.gpu_power,power_limit:hw.gpu_power_limit,pcie_gen:hw.gpu_pcie_gen,pcie_gen_max:hw.gpu_pcie_gen_max,pcie_width:hw.gpu_pcie_width,pcie_rx_mb:hw.gpu_pcie_rx_mb}]:[])).map(g=>{
-    const device=devices.find(d=>d.index===g.index);
-    const id=device?.id??`${device?.vendor??'unknown'}:${g.index}`;
+  const rows=hw.gpus??(devices.length===1?[{index:engineIndex(devices[0])??devices[0].index,util:hw.gpu_util,mem_used:hw.gpu_mem_used,temp:hw.gpu_temp,power:hw.gpu_power,power_limit:hw.gpu_power_limit,pcie_gen:hw.gpu_pcie_gen,pcie_gen_max:hw.gpu_pcie_gen_max,pcie_width:hw.gpu_pcie_width,pcie_rx_mb:hw.gpu_pcie_rx_mb}]:[]);
+  // The engine's `index` names a physical card (HIP's KFD order, nvidia-smi's order by PCI bus); the inventory's `index` is a position
+  // in the host's own list, and the two agree only when the lists come out in the same order. A reading that cannot be tied to a card
+  // is left out, so that card's tile says unavailable instead of showing another card's numbers.
+  const readings=rows.map(g=>{
+    const device=engineDevice(devices,g.index);
+    if(!device)return null;
+    const id=device.id??`${device.vendor}:${device.index}`;
     return mergeOwnReading({id,source:'engine',sampledAt:new Date().toISOString(),temperatureC:g.temp??null,utilizationPct:g.util??null,memoryUsedGb:gb(g.mem_used),powerW:g.power??null,powerLimitW:g.power_limit??null,pcieGen:g.pcie_gen??null,pcieGenMax:g.pcie_gen_max??null,pcieWidth:g.pcie_width??null,pcieRxMbs:g.pcie_rx_mb??null},own.get(id));
-  });
+  }).filter(Boolean);
   const last=raw.requests?.[0],used=live.state!=='idle'&&live.state!=='unloaded'?(live.prompt_tokens??0)+(live.generated??0):(last?.prompt_tokens??0)+(last?.output_tokens??0);
   const maximum=engine.max_context??fallback.context.maxTokens;
   const sampleCount=Math.max(0,...Object.values(history).filter(Array.isArray).map(v=>v.length));

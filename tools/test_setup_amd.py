@@ -337,6 +337,45 @@ class WindowsDetection(unittest.TestCase):
                                                        {"index": 2, "arch": "gfx1201"}])["index"], 2)
         self.assertIsNone(setup.hip_match({"index": 0, "arch": "gfx1100"}, [{"index": 0, "arch": "gfx1100"}], hip))
 
+    def test_a_name_only_one_device_carries_beats_the_rank(self):
+        """#325, #3418: the display-adapter order is not HIP's order, so the rank is a guess.  A name exactly one HIP
+        device carries settles it; when no name matches, the rank stands and setup says plainly that it is a guess."""
+        listed = [{"index": 0, "arch": "gfx1201", "name": "AMD Radeon RX 9070 XT"},
+                  {"index": 1, "arch": "gfx1201", "name": "AMD Radeon RX 7900 XT"}]
+        hip = [{"index": 0, "arch": "gfx1036", "name": "AMD Radeon(TM) Graphics"},
+               {"index": 1, "arch": "gfx1201", "name": "AMD Radeon RX 7900 XT"},
+               {"index": 2, "arch": "gfx1201", "name": "AMD Radeon RX 9070 XT"}]
+        self.assertEqual(setup.hip_match(listed[0], listed, hip)["index"], 2, "by name, not by rank")
+        self.assertTrue(setup.hip_number_is_certain(listed[0], hip))
+        bare = [{"index": 1, "arch": "gfx1201", "name": "gfx1201"}, {"index": 2, "arch": "gfx1201", "name": "gfx1201"}]
+        self.assertEqual(setup.hip_match(listed[1], listed, bare)["index"], 2)      # the rank, as before
+        self.assertFalse(setup.hip_number_is_certain(listed[1], bare), "no name tells the two cards apart")
+        same = [{"index": 1, "arch": "gfx1201", "name": "AMD Radeon RX 9070 XT"},
+                {"index": 2, "arch": "gfx1201", "name": "AMD Radeon RX 9070 XT"}]
+        self.assertFalse(setup.hip_number_is_certain(listed[0], same),
+                        "two cards of the same model: the number can still name the other one")
+
+    def test_setup_says_when_the_number_is_a_guess(self):
+        listed = [{"index": 0, "arch": "gfx1201", "name": "AMD Radeon RX 9070 XT", "driver": "32.0", "vram_gb": 16.0},
+                  {"index": 1, "arch": "gfx1201", "name": "AMD Radeon RX 7900 XT", "driver": "32.0", "vram_gb": 20.0}]
+        bare = [{"index": 1, "arch": "gfx1201", "name": "gfx1201", "vram_gb": 20.0, "driver": "hip"},
+                {"index": 2, "arch": "gfx1201", "name": "gfx1201", "vram_gb": 16.0, "driver": "hip"}]
+        lines = []
+        with mock.patch.object(setup, "hip_devices", lambda probe=None, text=None: bare), \
+                mock.patch.object(setup, "ok", lambda *a: lines.append(("ok", a[0]))), \
+                mock.patch.object(setup, "warn", lambda *a, **k: lines.append(("warn", a[0]))):
+            g = setup.hip_card(Path("engine"), listed[0], listed)
+        self.assertEqual(g["index"], 1, "the rank: the number that the display order gives, not one HIP names")
+        self.assertEqual(lines[0][0], "warn", "the number is not claimed as certain")
+        self.assertIn("a guess", lines[0][1])
+        lines.clear()
+        one = [{"index": 1, "arch": "gfx1201", "name": "gfx1201", "vram_gb": 16.0, "driver": "hip"}]
+        with mock.patch.object(setup, "hip_devices", lambda probe=None, text=None: one), \
+                mock.patch.object(setup, "ok", lambda *a: lines.append(("ok", a[0]))), \
+                mock.patch.object(setup, "warn", lambda *a, **k: lines.append(("warn", a[0]))):
+            g = setup.hip_card(Path("engine"), listed[0], listed)
+        self.assertEqual((g["index"], lines[0][0]), (1, "ok"), "the only card of that architecture: the number cannot be wrong")
+
     def test_hip_card(self):
         listed = setup.amd_gpus_windows(self.ADAPTERS, self.REGISTRY)
         with mock.patch.object(setup, "hip_devices", lambda probe=None, text=None: setup_hip(self.LIST)), \

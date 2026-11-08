@@ -4933,13 +4933,32 @@ def hip_runtime_beside_exe(eng: Path) -> None:
                      "request, close Strata and run START-HERE.bat again")
 
 
+def norm_name(text) -> str:
+    """A card name as two sources spell it (the registry's driver description and the engine's own device line): letters
+    and digits only, so "AMD Radeon RX 9070 XT" and "AMD Radeon(TM) RX9070XT" are the same name."""
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def hip_number_is_certain(card: dict, hip: list[dict]) -> bool:
+    """True when HIP's number for `card` cannot name a different physical card: one device of that architecture, or exactly
+    one whose name is the card's.  Otherwise `hip_match` answers with the rank, which the display order and HIP's order
+    agree on only by luck (#325, #3418)."""
+    same = [g for g in hip if g["arch"] == card["arch"]]
+    return len(same) == 1 or len([g for g in same if norm_name(g.get("name")) == norm_name(card.get("name"))]) == 1
+
+
 def hip_match(card: dict, listed: list[dict], hip: list[dict]) -> dict | None:
-    """The HIP device that is setup's `card` (from `listed`, the display-adapter order): the k-th device of the same
-    architecture, k = the card's rank among the listed cards of that architecture.  None when HIP has no such card."""
-    same = [g["index"] for g in listed if g["arch"] == card["arch"]]
-    k = same.index(card["index"]) if card["index"] in same else 0
-    cand = [g for g in hip if g["arch"] == card["arch"]]
-    return cand[k] if k < len(cand) else None
+    """The HIP device that is setup's `card` (from `listed`, the display-adapter order): the device whose name is the card's
+    when exactly one device carries that name; otherwise the k-th device of the same architecture, k = the card's rank among
+    the listed cards of that architecture, which the display order and HIP's order agree on only by luck (#325, #3418).
+    `hip_number_is_certain` says when that second answer is a guess.  None when HIP has no such card."""
+    same = [g for g in hip if g["arch"] == card["arch"]]
+    named = [g for g in same if norm_name(g.get("name")) == norm_name(card.get("name"))]
+    if len(named) == 1:
+        return named[0]
+    ranks = [g["index"] for g in listed if g["arch"] == card["arch"]]
+    k = ranks.index(card["index"]) if card["index"] in ranks else 0
+    return same[k] if k < len(same) else None
 
 
 def hip_card(eng: Path, gpu: dict, listed: list[dict]) -> dict:
@@ -4957,8 +4976,14 @@ def hip_card(eng: Path, gpu: dict, listed: list[dict]) -> dict:
         fail(f"the HIP runtime does not list your {gpu['name']} ({gpu['arch']})", hint)
     if amd_problem(m):
         fail(f"HIP device {m['index']} ({m['name']}) cannot be used: {amd_problem(m)}")
-    if gpu.get("driver") != "hip" and m["index"] != gpu["index"]:
-        ok(f"HIP numbers this card {m['index']} (an integrated GPU comes first): the engine is pointed at it")
+    if gpu.get("driver") != "hip":
+        if not hip_number_is_certain(gpu, hip):
+            share = len([g for g in hip if g["arch"] == gpu["arch"]])
+            warn(f"which HIP device is your {gpu['name']} is not known: {share} devices share {gpu['arch']} and their "
+                 f"names do not tell them apart, and the display-adapter order is not HIP's order (#325, #3418); "
+                 f"the engine is pointed at device {m['index']}, which is a guess")
+        elif m["index"] != gpu["index"]:
+            ok(f"HIP numbers this card {m['index']} (an integrated GPU comes first): the engine is pointed at it")
     vram = gpu["vram_gb"] if gpu.get("uma") else (m["vram_gb"] or gpu["vram_gb"])   # an APU: not the runtime's figure
     return {**gpu, "index": m["index"], "count": len(hip), "vram_gb": vram, "driver": "hip"}
 

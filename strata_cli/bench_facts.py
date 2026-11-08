@@ -225,6 +225,22 @@ def nvidia_gpus() -> tuple[list[dict], str | None, str | None]:
     return cards, (cards[0]["driver"] if cards else None), cuda
 
 
+# A card row's `device_index` is the engine's number. Where the local tool's own order is not that order, the row says so
+# instead of quietly writing a number that can belong to another card (#325, #3418).
+AMD_ORDER_NOTE = "the card number is the order the local tool lists the cards in, not the engine's (HIP's) order: an " \
+                 "integrated Radeon takes HIP's device 0 and pushes a discrete card to 1 (#325, #3418)"
+
+
+def kfd_device_order(listed: list[dict]) -> dict | None:
+    """`amd-smi list`'s cards as HIP numbers them: the KFD topology's GPU nodes in node order, the CPU nodes skipped, the
+    walk setup's `amd_gpus()` and serve/telemetry.py's `amd_device_dir()` do.  `amd-smi`'s own order is not necessarily
+    that order, so the number is taken from `node_id`.  {amd-smi card id: HIP number}; None when no node id came."""
+    gpus = [e for e in listed if e.get("node_id") is not None]
+    if not gpus:
+        return None
+    return {e.get("gpu"): k for k, e in enumerate(sorted(gpus, key=lambda e: int(e["node_id"])))}
+
+
 def other_gpus() -> tuple[list[dict], str | None]:
     """AMD (rocm-smi, or the Windows registry), Apple silicon: -> (cards, driver version)."""
     cards, driver = [], None
@@ -239,11 +255,14 @@ def other_gpus() -> tuple[list[dict], str | None]:
         try:
             if str(ROOT) not in sys.path:
                 sys.path.insert(0, str(ROOT))
-            from serve.telemetry import windows_amd_cards
-            found = windows_amd_cards()
+            from serve.telemetry import windows_amd_cards, windows_display_adapters
+            kept = windows_amd_cards(windows_display_adapters("amd"))
+            # Windows gives no bus id for a display adapter, so a number is only claimed when it cannot point at a
+            # different card: the report keeps the order the registry lists and says so when more than one card is here.
             cards = [{"device_index": i, "name": c["name"], "memory_bytes": c.get("vram_bytes") or None,
-                      "memory_kind": "dedicated", "power_limit_w": None} for i, c in enumerate(found)]
-            driver = next((c.get("driver") for c in found if c.get("driver")), None)
+                      "memory_kind": "dedicated", "power_limit_w": None,
+                      **({"number_note": AMD_ORDER_NOTE} if len(kept) > 1 else {})} for i, c in enumerate(kept)]
+            driver = next((c.get("driver") for c in kept if c.get("driver")), None)
         except Exception:                               # noqa: BLE001 - a report without the card's name is still a report
             pass
     elif os.name != "nt" and sys.platform != "darwin":      # (a Mac has no AMD card to ask for; its chip is read below)
@@ -256,11 +275,14 @@ def other_gpus() -> tuple[list[dict], str | None]:
             except (ValueError, OSError):
                 return []
         try:
-            bdf = {e.get("gpu"): (e.get("bdf") or "") for e in json.loads(run_cmd(["amd-smi", "list", "--json"]).strip() or "[]")}
+            listed = json.loads(run_cmd(["amd-smi", "list", "--json"]).strip() or "[]")
         except (ValueError, OSError):
-            bdf = {}
+            listed = []
+        bdf = {e.get("gpu"): (e.get("bdf") or "") for e in listed}
+        order = kfd_device_order(listed)          # the number HIP gives each card, not amd-smi's own order
         drv = {e.get("gpu"): ((e.get("driver") or {}).get("version") or "") for e in amd_json(["--driver"])}
-        for i, e in enumerate(amd_json(["--asic"])):
+        asic = amd_json(["--asic"])
+        for i, e in enumerate(asic):
             name = ((e.get("asic") or {}).get("market_name") or "").strip()
             if not name:
                 continue
@@ -275,8 +297,9 @@ def other_gpus() -> tuple[list[dict], str | None]:
                         vram = int(total) if total.isdigit() else None
                 except OSError:
                     pass
-            cards.append({"device_index": i, "name": name, "memory_bytes": vram, "memory_kind": "dedicated",
-                          "power_limit_w": None})
+            cards.append({"device_index": (order or {}).get(e.get("gpu"), i), "name": name, "memory_bytes": vram,
+                          "memory_kind": "dedicated", "power_limit_w": None,
+                          **({"number_note": AMD_ORDER_NOTE} if order is None and len(asic) > 1 else {})})
     elif sys.platform == "darwin":
         chip = cpu_name()
         if chip:
@@ -400,6 +423,8 @@ def hardware(why: Why, *, selected: list[int], served_gpu: str | None, model_dir
             why.add(pointer("hardware", "gpus", i, "memory_bytes"), "the local tools did not report this card's memory")
         if gpus[-1]["power_limit_w"] is None:
             why.add(pointer("hardware", "gpus", i, "power_limit_w"), "no power limit available for this card from the local tools")
+        if card.get("number_note"):
+            why.add(pointer("hardware", "gpus", i, "device_index"), card["number_note"])
     ram = ram_bytes()
     cpu = cpu_name()
     drive = storage_of(model_dir)

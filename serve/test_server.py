@@ -5253,6 +5253,49 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
 
+    def test_windows_names_are_claimed_only_when_they_cannot_be_wrong(self):
+        """#1587 took the display-adapter class order as HIP's order; #325 and #3418 showed the two orders differ, so a
+        number is answered with a name only when it cannot point at another device, and the rest says it is not identified."""
+        from serve import telemetry
+        apu = {"name": "AMD Radeon(TM) Graphics", "provider": "Advanced Micro Devices, Inc.", "driver": "24.3.0",
+               "vram_bytes": 512 << 20}
+        xtx = {"name": "AMD Radeon RX 7900 XTX", "provider": "Advanced Micro Devices, Inc.", "driver": "24.3.0",
+               "vram_bytes": 24 << 30}
+        r9700 = {"name": "AMD Radeon AI PRO R9700", "provider": "Advanced Micro Devices, Inc.", "driver": "24.3.0",
+                 "vram_bytes": 32 << 30}
+        self.assertEqual(telemetry.named_amd_cards([0], [apu]), [apu])            # the only AMD device
+        self.assertEqual(telemetry.named_amd_cards([0], [xtx]), [xtx])
+        self.assertEqual(telemetry.named_amd_cards([0], [apu, xtx]), [xtx])       # the chip cannot run a model: HIP's number is the card
+        self.assertEqual(telemetry.named_amd_cards([0, 1], [xtx, r9700]), [None, None], "two cards that can run a model: no number can be claimed")
+        self.assertEqual(telemetry.named_amd_cards([1, 0], [apu, xtx, r9700]), [None, None])
+        self.assertEqual(telemetry.windows_amd_cards([apu, xtx]), [xtx])          # the 2 GiB rule itself is unchanged
+        self.assertIsNone(telemetry.unnamed_card_note([0], [apu]))
+        self.assertEqual(telemetry.unnamed_card_note([0, 1], [xtx, None]),
+                         "cannot name the card the engine numbers 1: the registry's display-adapter order is not HIP's order (#325, #3418)")
+        self.assertEqual(telemetry.unnamed_card_note([0, 1], [None, None]),
+                         "cannot name the card the engine numbers 0, 1: the registry's display-adapter order is not HIP's order (#325, #3418)")
+
+    def test_the_dashboard_says_which_card_it_cannot_name(self):
+        """The static block the web page and `strata status` read: the vendor when no number can be tied to a device,
+        and the note that says so; a single AMD device still names the card, as #1587 asked."""
+        from serve import telemetry
+        two = [{"name": "AMD Radeon RX 7900 XTX", "provider": "Advanced Micro Devices, Inc.", "driver": "24.3.0",
+                "vram_bytes": 24 << 30},
+               {"name": "AMD Radeon AI PRO R9700", "provider": "Advanced Micro Devices, Inc.", "driver": "24.3.0",
+                "vram_bytes": 32 << 30}]
+        with mock.patch.object(telemetry.os, "name", "nt"), mock.patch.object(telemetry, "windows_display_adapters",
+                                                                             lambda vendor=None: two):
+            blocked = telemetry.Telemetry(amd=True, gpu_indices=[0, 1])
+        self.assertEqual(blocked.static["gpu_name"], "AMD Radeon", "no card is named, only the vendor")
+        self.assertIn("cannot name the card the engine numbers 0, 1", blocked.static["gpu_note"] or "")
+        self.assertIsNone(blocked.static["gpu_vram_total_mib"], "sizes that cannot be attributed to a card are not summed")
+        with mock.patch.object(telemetry.os, "name", "nt"), mock.patch.object(telemetry, "windows_display_adapters",
+                                                                             lambda vendor=None: two[:1]):
+            one = telemetry.Telemetry(amd=True)
+        self.assertEqual(one.static["gpu_name"], "AMD Radeon RX 7900 XTX")
+        self.assertEqual(one.static["gpu_vram_total_mib"], 24 << 10)
+        self.assertNotIn("cannot name", one.static["gpu_note"] or "", "the only card: nothing to say")
+
     def test_free_vram_on_hip(self):
         from serve import telemetry
         tok = ByteTokenizer()

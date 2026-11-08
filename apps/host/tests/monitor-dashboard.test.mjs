@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCpuTopology, parseNvidiaReadings, parsePcieThroughput, gpuMemoryTotals, pickGpuTemperature, isComputeAdapter } from '../server/device-probes.mjs';
+import { parseCpuTopology, parseNvidiaReadings, parsePcieThroughput, gpuMemoryTotals, pickGpuTemperature, isComputeAdapter,
+  normalizeBusId, isPciBusName, busIdFromPath, parseKfdNode, kfdGpuOrder, assignEngineNumbers, engineDevice as engineDeviceHost } from '../server/device-probes.mjs';
 import { cpuUtilization, diskRate, parseLinuxDiskCounters, parseMacDiskCounters } from '../server/system-telemetry.mjs';
 import { parseEngineMetrics } from '../server/supervisor.mjs';
 import { originalDashboard, mergeOwnReading } from '../server/monitor-dashboard.mjs';
-import { gpuMetric, gpuCapacity, gpuReported, shortGpuName, defaultGpuSet, gpuId } from '../src/lib/monitor-hardware.ts';
+import { gpuMetric, gpuCapacity, gpuReported, shortGpuName, defaultGpuSet, gpuId, engineDevice as engineDeviceScreen } from '../src/lib/monitor-hardware.ts';
 import { referencePaths } from '../src/lib/monitor-chart.ts';
 
 const gpu=(id,index=0,unified=false)=>({id,index,unified,vramGb:24,name:id,vendor:'nvidia',backend:'cuda'});
@@ -163,4 +164,72 @@ test('a remote-console chip with no memory is not a GPU; an unnamed card with me
   assert.equal(isComputeAdapter('unknown',8*1024**3),true);
   assert.equal(isComputeAdapter('intel',null),true);
   assert.equal(isComputeAdapter('amd',34208743424),true);
+});
+
+// ---- the engine's card number, resolved to a physical card ----
+// The host's `index` is a position in its own list; the engine numbers the physical cards (HIP's KFD order, nvidia-smi's
+// order by PCI bus). The rule lives in two copies because the server cannot import the client library, so the same table is
+// run through both.
+const engineCard=(name,index,over={})=>({name,index,engineIndex:null,vendor:'amd',vramGb:24,unified:false,backend:'vulkan',...over});
+const ENGINE_TABLE=[
+  {case:'the host lists the discrete card first while the engine numbers the integrated Radeon 0 (#325, #3418)',
+   devices:[engineCard('RX 7900 XTX',0,{engineIndex:1}),engineCard('Radeon 780M',1,{engineIndex:0,vramGb:0.5})],
+   wants:{0:1,1:0}},
+  {case:'a card the engine numbering does not reach claims nothing while another card has an identity',
+   devices:[engineCard('RTX 4070',0,{engineIndex:1,vendor:'nvidia',backend:'cuda'}),engineCard('UHD 770',1,{vendor:'intel',unified:true,vramGb:1})],
+   wants:{0:null,1:0,2:null}},
+  {case:'with no identity for any card, a reading can only belong to the card the engine can run a model on',
+   devices:[engineCard('Radeon 780M',0,{vramGb:0.5}),engineCard('RX 7900 XTX',1)],
+   wants:{0:1,1:1}},
+  {case:'with no identity and two cards that can run a model, the number has to name exactly one card',
+   devices:[engineCard('RX 7900 XTX',0),engineCard('RX 7900 XT',1)],
+   wants:{0:0,1:1,2:null}},
+  {case:'a single card with no identity is that card',
+   devices:[engineCard('RX 7900 XTX',0)],
+   wants:{0:0,1:null}},
+];
+test('an engine reading is matched to the physical card, and the rule is the same in both copies',()=>{
+  for(const row of ENGINE_TABLE) for(const [number,position] of Object.entries(row.wants)) {
+    const n=Number(number),host=engineDeviceHost(row.devices,n),screen=engineDeviceScreen(row.devices,n);
+    assert.equal(host,screen,`${row.case}: the two copies answer with a different card for engine number ${n}`);
+    assert.equal(host,row.devices[position]??null,`${row.case}: engine number ${n}`);
+  }
+});
+test("the engine's card order is the KFD topology's GPU nodes in node order, the CPU nodes skipped (#325, #3418)",()=>{
+  const nodes=[parseKfdNode('cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\n'),
+    parseKfdNode('simd_count 128\ngfx_target_version 120001\nbdf 0000:01:00.0\n'),
+    parseKfdNode('simd_count 128\ngfx_target_version 120001\nbdf 0000:03:00.0\n')];
+  assert.deepEqual(kfdGpuOrder(nodes),['0000:01:00.0','0000:03:00.0']);
+  // The host's own list comes out in the other order, so the engine's numbers land on other positions.
+  const host=[{...engineCard('RX 7900 XTX',0,{busId:'0000:03:00.0'})},{...engineCard('Radeon 780M',1,{busId:'00000000:01:00.0',vramGb:0.5})}];
+  const resolved=assignEngineNumbers(host,kfdGpuOrder(nodes));
+  assert.deepEqual(resolved.map(g=>g.engineIndex),[1,0]);
+  assert.equal(engineDeviceHost(resolved,0),resolved[1],'engine 0 is the APU, not the card at position 0');
+  assert.equal(engineDeviceScreen(resolved,1),resolved[0],'and engine 1 is the discrete card, not the card at position 1');
+  assert.equal(kfdGpuOrder([parseKfdNode('simd_count 128\ngfx_target_version 120001\n')]),null,'a node whose card cannot be identified');
+  assert.equal(kfdGpuOrder([parseKfdNode('cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\n')]),null,'no GPU node at all');
+  assert.deepEqual(assignEngineNumbers([{...engineCard('RTX 4070',2,{vendor:'nvidia',backend:'cuda',sensorIndex:2})}],null).map(g=>g.engineIndex),[2],
+    'nvidia-smi numbers by PCI bus, so its own index is the engine number');
+  assert.deepEqual(assignEngineNumbers([engineCard('RX 7900 XTX',0,{busId:'0000:03:00.0'})],null).map(g=>g.engineIndex),[null],
+    'no amdgpu tree (a container that hides /sys): the number is not claimed');
+});
+test('the two spellings of a PCI bus id name the same card, and a resolved sysfs path names the card by its last PCI part',()=>{
+  assert.equal(normalizeBusId('00000000:03:00.0'),normalizeBusId('0000:03:00.0'));
+  assert.equal(normalizeBusId('0000:0A:00.0'),'0000:0a:00.0');
+  assert.equal(normalizeBusId(''),null);
+  assert.equal(busIdFromPath('/sys/devices/pci0000:00/0000:00:01.1/0000:03:00.0/drm/renderD129'),'0000:03:00.0',
+    'a bridge hop has the same shape, so the first match is not the card');
+  assert.equal(isPciBusName('pci0000:00'),false);
+});
+test('the dashboard puts an engine reading on the card it belongs to and leaves an unresolved number unclaimed',()=>{
+  const discrete={...engineCard('AMD Radeon RX 7900 XTX',0,{engineIndex:1,id:'drm:0000:03:00.0',busId:'0000:03:00.0'})};
+  const apu={...engineCard('AMD Radeon(TM) Graphics',1,{engineIndex:0,id:'drm:0000:01:00.0',busId:'0000:01:00.0',vramGb:0.5})};
+  const raw={...rawNoGpu,hardware:{gpus:[{index:1,util:80,mem_used:4*1024**3,temp:61,power:200}]}};
+  const mapped=originalDashboard(raw,{gpus:[discrete,apu]},shell([ownReading(discrete.id)]));
+  assert.equal(mapped.hardware.gpus.length,1);
+  assert.equal(mapped.hardware.gpus[0].id,discrete.id,'the reading is the inference card, not the number in the host list');
+  assert.equal(mapped.hardware.gpus[0].utilizationPct,80);
+  // A number that belongs to no card is dropped, so that card's tile stays unavailable.
+  const two=originalDashboard({...raw,hardware:{gpus:[{index:0,util:50},{index:2,util:90}]}},{gpus:[discrete,apu]},shell([]));
+  assert.deepEqual(two.hardware.gpus.map(r=>r.id),[apu.id],'the unresolved number is not claimed for any card');
 });

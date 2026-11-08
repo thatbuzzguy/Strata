@@ -27,3 +27,19 @@ test('GPU histories retain their device scope and never spread one card reading 
  const across=nativeMonitorData({instances:[split],hardware:{gpus:[{index:0},{index:1}]}},two);
  assert.deepEqual(across.history[0].gpuIds,['gpu0','gpu1']);assert.equal(across.history[0].gpus,undefined);assert.deepEqual(across.hardware.gpus.map(gpu=>gpu.utilizationPct),[40,80]);
 });
+
+test('an engine reading is put on the physical card the engine numbers it as, not on the same number in the host list (#325, #3418)',()=>{
+  // The host lists the discrete card first, so its position is 0; the engine numbers the integrated Radeon 0 and the card 1.
+  const discrete={id:'drm:0000:03:00.0',index:0,engineIndex:1,vendor:'amd',name:'AMD Radeon RX 7900 XTX',vramGb:24,unified:false,backend:'vulkan'};
+  const apu={id:'drm:0000:01:00.0',index:1,engineIndex:0,vendor:'amd',name:'AMD Radeon(TM) Graphics',vramGb:0.5,unified:false,backend:'vulkan'};
+  const two={...inventory,gpus:[discrete,apu]};
+  const data=nativeMonitorData({instances:[instance],hardware:{gpus:[{index:0}]}},two);
+  assert.deepEqual(data.hardware.gpus.map(gpu=>gpu.id),[discrete.id,apu.id]);
+  assert.equal(data.hardware.gpus[1].utilizationPct,80,'the reading for engine 0 is the APU, not the card at position 0');
+  assert.equal(data.hardware.gpus[0].utilizationPct,null,'the card at position 0 is not the engine number 0 card');
+  assert.deepEqual(data.history[0].gpuIds,[apu.id],'the history keeps the reading on the card it belongs to');
+  // A number that belongs to no card is not claimed for one, so that card's tile stays unavailable.
+  const loose={...inventory,gpus:[discrete,{...apu,engineIndex:null}]};
+  const none=nativeMonitorData({instances:[{...instance,metrics:{...instance.metrics,hardware:{gpus:[{index:2,util:90}]}}}],hardware:{gpus:[{index:0}]}},loose);
+  assert.deepEqual(none.hardware.gpus.map(gpu=>gpu.utilizationPct),[null,null],'engine 2 names no card here, so nothing is claimed');
+});

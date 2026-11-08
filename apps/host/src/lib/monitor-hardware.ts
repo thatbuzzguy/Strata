@@ -2,6 +2,31 @@ import type { GpuInfo, GpuReading } from './types';
 export const hasReading=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v);
 export const gpuId=(gpu:GpuInfo)=>gpu.id??`${gpu.vendor}:${gpu.index}`;
 
+/** The engine's number resolved to this card, or null when it is not known. */
+export const engineIndex=(gpu:GpuInfo):number|null=>Number.isInteger(gpu.engineIndex)?gpu.engineIndex as number:null;
+
+/** A card Strata cannot run a model on: an integrated chip with a carve-out under 2 GB beside a real card. */
+const small=(g:GpuInfo)=>g.backend==='vulkan'&&(g.vendor==='amd'||g.vendor==='intel')&&g.vramGb<2&&!g.unified;
+
+/**
+ * The card an engine reading for card `number` belongs to. The engine numbers the physical cards (HIP's KFD order, nvidia-smi's
+ * order by PCI bus); `index` is a position in the host's own list, and an integrated chip or an adapter the probe drops shifts
+ * that list, so the two agree only when the lists happen to come out in the same order. Identity first. With no identity for any
+ * card, a reading can only belong to a card the engine can run a model on - one such card is the card; else the number has to name
+ * exactly one card. Otherwise nothing is claimed, so a tile says unavailable instead of showing another card's numbers. Mirrored in
+ * server/device-probes.mjs (the server cannot import this file); tests/monitor-dashboard.test.mjs runs the same table through both.
+ */
+export function engineDevice(devices:GpuInfo[],number:number):GpuInfo|null {
+  const known=devices.filter(d=>engineIndex(d)!==null);
+  const hit=known.find(d=>engineIndex(d)===number);
+  if(hit)return hit;
+  if(known.length)return null;
+  const canRun=devices.filter(d=>!small(d));
+  if(devices.length>1&&canRun.length===1)return canRun[0];
+  const same=devices.filter(d=>d.index===number);
+  return same.length===1?same[0]:null;
+}
+
 /** A total, mean, or maximum must cover every selected device. Partial totals are misleading. */
 export function gpuMetric(devices:GpuInfo[],readings:GpuReading[]|undefined,key:keyof GpuReading,mode:'sum'|'mean'|'max'='sum'):number|null {
   const values=devices.map(device=>readings?.find(reading=>reading.id===gpuId(device))?.[key]);
@@ -37,7 +62,6 @@ export function gpuCapacity(devices:GpuInfo[]) {
  */
 export function defaultGpuSet(devices:GpuInfo[]):GpuInfo[] {
   const real=(g:GpuInfo)=>g.vramGb>=4||g.vendor==='nvidia'||g.backend==='cuda';
-  const small=(g:GpuInfo)=>g.backend==='vulkan'&&(g.vendor==='amd'||g.vendor==='intel')&&g.vramGb<2&&!g.unified;
   if(!devices.some(real))return devices;
   const kept=devices.filter(g=>!small(g));
   return kept.length?kept:devices;

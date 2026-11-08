@@ -28,6 +28,8 @@ export interface GpuReading { id:string; temperatureC:number|null; utilizationPc
 export interface GpuInfo {
   id?: string;
   index: number;
+  /** The number the engine gives this physical card (HIP's KFD order, nvidia-smi's order by PCI bus); null when it cannot be resolved. `index` is a position in the host's own list and stays the label the screens show. */
+  engineIndex?: number | null;
   vendor: 'apple' | 'nvidia' | 'amd' | 'intel' | 'unknown';
   name: string;
   vramGb: number;

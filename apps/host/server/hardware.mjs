@@ -7,7 +7,7 @@
  */
 import os from 'node:os';
 import { readFile } from 'node:fs/promises';
-import { parseCpuTopology, parseWindowsProcessors, parseNvidiaDevices, detectDrmGpus } from './device-probes.mjs';
+import { parseCpuTopology, parseWindowsProcessors, parseNvidiaDevices, detectDrmGpus, normalizeBusId, readKfdGpuOrder, assignEngineNumbers } from './device-probes.mjs';
 import { CONTEXT_TOKENS, VARIANTS, footprint } from './catalog.mjs';
 import { MODELS_DIR, diskFreeGb, diskTotalGb } from './store.mjs';
 import { probe, round } from './util.mjs';
@@ -182,7 +182,7 @@ async function detectGpus(platform, totalGb) {
   if(platform==='linux') {
     const drm=await detectDrmGpus();
     for(const gpu of drm) {
-      const existing=gpus.find(g=>g.busId?.replace(/^00000000:/,'0000:')===gpu.busId);
+      const existing=gpus.find(g=>normalizeBusId(g.busId)===normalizeBusId(gpu.busId));
       if(existing)existing.sensorPath=gpu.sensorPath;else gpus.push(gpu);
     }
   }
@@ -197,7 +197,10 @@ async function detectGpus(platform, totalGb) {
   }
   gpus.forEach((g,i)=>{g.index=i;});
 
-  return gpus;
+  /* `index` is a position in this list; the engine numbers the physical cards (HIP's KFD order, nvidia-smi's order by PCI bus).
+     The two agree only when the lists happen to come out in the same order, so the engine's number for each card is resolved to
+     the card here and kept beside `index`, which stays the label the screens show. */
+  return assignEngineNumbers(gpus, platform==='linux' ? await readKfdGpuOrder() : null);
 }
 
 function pickAccelerator(gpus, cpu, totalGb) {

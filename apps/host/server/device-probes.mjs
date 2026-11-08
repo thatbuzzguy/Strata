@@ -64,6 +64,98 @@ async function read(path) { try {return (await readFile(path,'utf8')).trim();} c
 async function list(path) {try{return await readdir(path);}catch{return [];}}
 /** A server's remote-console chip (ASPEED), a virtual display or a framebuffer is not a graphics card: no maker we know and no memory of its own. */
 export function isComputeAdapter(vendor,vramBytes) { return vendor!=='unknown'||vramBytes>0; }
+
+/** The PCI bus id in one spelling: nvidia-smi writes "00000000:03:00.0", the sysfs device folder is named "0000:03:00.0". */
+export function normalizeBusId(bus) {
+  const text = String(bus ?? '').trim().toLowerCase();
+  return text ? text.replace(/^0{4,}:/, '0000:') : null;
+}
+/** A path segment that names a PCI device ("0000:03:00.0"), the same shape serve/telemetry.py checks. */
+export function isPciBusName(part) {
+  const s = String(part ?? '');
+  return s.length === 12 && s[4] === ':' && s[7] === ':' && s[10] === '.' && '01234567'.includes(s[11]) &&
+    /^[0-9a-f]{4}$/.test(s.slice(0,4)) && /^[0-9a-f]{2}$/.test(s.slice(5,7)) && /^[0-9a-f]{2}$/.test(s.slice(8,10));
+}
+/**
+ * The PCI bus id inside a resolved sysfs path: the card's own device folder is the last PCI-named part. An earlier part can
+ * be a bridge hop with the same shape ("0000:00:01.1"), so the first match is not the card.
+ */
+export function busIdFromPath(path) { return String(path ?? '').split('/').filter(isPciBusName).at(-1) ?? null; }
+
+/** One KFD topology node's `properties` text -> what the engine's numbering needs: {bdf, gfx, simds, minor}. */
+export function parseKfdNode(raw) {
+  const props = {};
+  for (const line of String(raw ?? '').split('\n')) {
+    const [key,...rest] = line.trim().split(/\s+/);
+    if (key) props[key] = rest.join(' ');
+  }
+  return {bdf:props.bdf ?? null,gfx:number(props.gfx_target_version) ?? 0,simds:number(props.simd_count) ?? 0,minor:props.drm_render_minor ?? null};
+}
+
+/**
+ * The cards in the order the engine numbers them (HIP): the KFD topology's GPU nodes in node order, the CPU nodes skipped -
+ * the walk setup.py's `amd_gpus()` and serve/telemetry.py's `amd_device_dir()` do. The host's own `index` is a position in
+ * its own list, and an integrated Radeon or an adapter the probe drops shifts that list, so the engine's number has to be
+ * resolved to a physical card rather than assumed. Null when the order cannot be built (no amdgpu, a container that hides
+ * /sys, a GPU node whose card cannot be identified). Pure: `nodes` are parsed KFD node properties in node order.
+ */
+export function kfdGpuOrder(nodes) {
+  const gpus = nodes.filter(n => n.gfx > 0 && n.simds > 0);
+  if (!gpus.length) return null;
+  const order = gpus.map(n => normalizeBusId(n.bdf));
+  return order.some(b => b === null) ? null : order;
+}
+/** The same order read from sysfs, a node without a `bdf` identified through its render node. */
+export async function readKfdGpuOrder(sysfs = '/sys') {
+  const base = `${sysfs}/class/kfd/kfd/topology/nodes`;
+  const entries = await list(base);
+  if (!entries.length) return null;
+  const nodes = [];
+  for (const name of entries.filter(n => /^\d+$/.test(n)).sort((a,b) => Number(a)-Number(b))) {
+    const node = parseKfdNode(await read(`${base}/${name}/properties`));
+    if (!node.bdf && node.minor) node.bdf = busIdFromPath(await realpath(`${sysfs}/class/drm/renderD${node.minor}`));
+    nodes.push(node);
+  }
+  return kfdGpuOrder(nodes);
+}
+
+/**
+ * The number the engine gives each card, kept as `engineIndex` (null when it cannot be resolved). nvidia-smi's own index is
+ * the engine's number (it numbers by PCI bus); an amdgpu card's is its position in `kfdOrder`; a card the engine's numbering
+ * does not reach (an Intel or Apple GPU, a card outside the KFD tree) stays null, and its engine reading is not claimed for it.
+ */
+export function assignEngineNumbers(devices,kfdOrder = null) {
+  return devices.map(g => {
+    if (g.vendor==='nvidia') return {...g,engineIndex:g.sensorIndex ?? g.index};
+    const at = kfdOrder ? kfdOrder.indexOf(normalizeBusId(g.busId)) : -1;
+    return {...g,engineIndex:at>=0?at:null};
+  });
+}
+
+/** The engine's number resolved to this card, or null when it is not known. */
+export const engineIndex = gpu => Number.isInteger(gpu.engineIndex) ? gpu.engineIndex : null;
+
+/** A card Strata cannot run a model on: an integrated chip with a carve-out under 2 GB beside a real card. Mirrored in src/lib/monitor-hardware.ts. */
+export function smallGpu(gpu) { return gpu.backend === 'vulkan' && (gpu.vendor === 'amd' || gpu.vendor === 'intel') && (gpu.vramGb ?? 0) < 2 && !gpu.unified; }
+
+/**
+ * The card an engine reading for card `number` belongs to. The engine numbers the physical cards (HIP's KFD order, nvidia-smi's
+ * order by PCI bus); `index` is a position in the host's own list, and an integrated chip or an adapter the probe drops shifts
+ * that list, so the two agree only when the lists happen to come out in the same order. Identity first. With no identity for any
+ * card, a reading can only belong to a card the engine can run a model on - one such card is the card; else the number has to name
+ * exactly one card. Otherwise nothing is claimed, so a tile says unavailable instead of showing another card's numbers. Mirrored in
+ * src/lib/monitor-hardware.ts; tests/monitor-dashboard.test.mjs runs the same table through both.
+ */
+export function engineDevice(devices,number) {
+  const known = devices.filter(d => engineIndex(d) !== null);
+  const hit = known.find(d => engineIndex(d) === number);
+  if (hit) return hit;
+  if (known.length) return null;
+  const canRun = devices.filter(d => !smallGpu(d));
+  if (devices.length > 1 && canRun.length === 1) return canRun[0];
+  const same = devices.filter(d => d.index === number);
+  return same.length === 1 ? same[0] : null;
+}
 /**
  * The temperature of an amdgpu card from its hwmon inputs [{label, milli}]: the edge sensor (what nvtop and rocm-smi show), else the
  * junction, else the first one that has a plausible value. Cards such as the Instinct line have no edge sensor. 0 is no reading.
@@ -76,10 +168,12 @@ export function pickGpuTemperature(inputs) {
 }
 export async function detectDrmGpus() {
   const result=[];
-  for(const card of (await list('/sys/class/drm')).filter(n=>/^card\d+$/.test(n))) {
+  /* The order is the physical order, not readdir's: the host's `index` is a position in this list, and an unsorted read
+     would make it change between probes. */
+  for(const card of (await list('/sys/class/drm')).filter(n=>/^card\d+$/.test(n)).sort((a,b) => Number(a.slice(4))-Number(b.slice(4)))) {
     const device=`/sys/class/drm/${card}/device`;
     let resolved;try{resolved=await realpath(device);}catch{continue;}
-    const busId=resolved.split('/').at(-1),vendorId=await read(`${device}/vendor`);
+    const busId=normalizeBusId(busIdFromPath(resolved)),vendorId=await read(`${device}/vendor`);
     const vendor={'0x1002':'amd','0x8086':'intel','0x10de':'nvidia'}[vendorId]??'unknown';
     const name=await probe('lspci',['-s',busId]);
     const bytes=number(await read(`${device}/mem_info_vram_total`));
